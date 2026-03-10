@@ -41,10 +41,30 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```",
 _CITATION_ID_RE = re.compile(r"[Cc](\d+)")
 _NAME_LINE_RE = re.compile(r"Name:\s*([^\n\r]+)")
 _PARTY_QUERY_RE = re.compile(
-    r"\b(who|name|names)\b.*\b(contract[\s-]?holders?|tenant|landlord|parties?)\b"
-    r"|\b(contract[\s-]?holders?|tenant|landlord|parties?)\b.*\b(who|name|names)\b",
+    r"\b(who|name|names|identify|list)\b.*\b(contract[\s-]?holders?|tenant|"
+    r"landlord|parties?|agents?|principal\s+contact)\b"
+    r"|\b(contract[\s-]?holders?|tenant|landlord|parties?|agents?|principal\s+"
+    r"contact)\b.*\b(who|name|names|identify|list)\b",
     re.IGNORECASE,
 )
+_PARTY_IDENTITY_BLOCKLIST = {
+    "obligation",
+    "obligations",
+    "responsibility",
+    "responsibilities",
+    "must",
+    "shall",
+    "rent",
+    "payment",
+    "notice",
+    "term",
+    "deposit",
+    "rights",
+    "deadline",
+    "penalty",
+    "default",
+    "termination",
+}
 _ROLE_LABELS = {
     "contract_holder": ("the contract-holder",),
     "landlord": ("the landlord",),
@@ -1184,7 +1204,24 @@ class ContractRAGEngine:
 
     @staticmethod
     def _is_party_identity_query(query: str) -> bool:
-        return bool(_PARTY_QUERY_RE.search(query))
+        if _PARTY_QUERY_RE.search(query):
+            return True
+        lowered = query.lower()
+        if any(term in lowered for term in _PARTY_IDENTITY_BLOCKLIST):
+            return False
+        party_terms = (
+            "contract-holder",
+            "contract holder",
+            "tenant",
+            "landlord",
+            "parties",
+            "party",
+            "agent",
+            "principal contact",
+        )
+        if any(term in lowered for term in party_terms):
+            return True
+        return False
 
     @staticmethod
     def _split_name_field(raw: str) -> list[str]:
@@ -1235,6 +1272,21 @@ class ContractRAGEngine:
                     # Use the closest meaningful Name: line after role header.
                     return parsed
         return self._unique_preserve_order(names)
+
+    def _extract_role_name_line(self, chunk: str, role: str) -> str:
+        labels = _ROLE_LABELS.get(role, ())
+        if not labels:
+            return ""
+        lower_chunk = chunk.lower()
+        for label in labels:
+            idx = lower_chunk.find(label.lower())
+            if idx < 0:
+                continue
+            window = chunk[idx:idx + 850]
+            match = _NAME_LINE_RE.search(window)
+            if match:
+                return match.group(0).strip()
+        return ""
 
     def _extract_known_parties(
             self, chunks: list[str]) -> dict[str, dict[str, list[Any]]]:
@@ -1329,6 +1381,19 @@ class ContractRAGEngine:
         landlord_cites = [int(x) for x in parties["landlords"]["citations"]]
         agent_cites = [int(x) for x in parties["agents"]["citations"]]
 
+        contract_line = ""
+        if contract_cites:
+            contract_line = self._extract_role_name_line(
+                chunks[contract_cites[0]], "contract_holder")
+        landlord_line = ""
+        if landlord_cites:
+            landlord_line = self._extract_role_name_line(
+                chunks[landlord_cites[0]], "landlord")
+        agent_line = ""
+        if agent_cites:
+            agent_line = self._extract_role_name_line(
+                chunks[agent_cites[0]], "agent")
+
         if not contract_names and not landlord_names and not agent_names:
             raise ValueError("No party names found in extracted text")
 
@@ -1337,15 +1402,18 @@ class ContractRAGEngine:
         evidence_lines: list[str] = []
         missing_lines: list[str] = []
 
-        if contract_names:
+        if contract_names or contract_line:
             citation = f"[C{contract_cites[0]}]" if contract_cites else ""
-            names_text = ", ".join(contract_names)
+            if contract_names:
+                names_text = ", ".join(contract_names)
+            else:
+                names_text = contract_line.split(":", 1)[-1].strip()
             direct_lines.append(f"- Contract-holder(s): {names_text} {citation}".strip())
             key_lines.append(
                 f"- The parties section lists contract-holder names as: {names_text} {citation}"
                 .strip())
             if contract_cites:
-                quote = self._snippet_for_citation(
+                quote = contract_line or self._snippet_for_citation(
                     chunks[contract_cites[0]],
                     prefer_terms=contract_names + ["contract-holder"])
                 evidence_lines.append(f'- "{quote}" [C{contract_cites[0]}]')
@@ -1354,28 +1422,35 @@ class ContractRAGEngine:
             missing_lines.append(
                 "- Contract-holder names are missing or unreadable in extracted PDF text.")
 
-        if landlord_names:
+        if landlord_names or landlord_line:
             citation = f"[C{landlord_cites[0]}]" if landlord_cites else ""
-            names_text = ", ".join(landlord_names)
+            if landlord_names:
+                names_text = ", ".join(landlord_names)
+            else:
+                names_text = landlord_line.split(":", 1)[-1].strip()
             direct_lines.append(f"- Landlord: {names_text} {citation}".strip())
             key_lines.append(
                 f"- The parties section lists the landlord as: {names_text} {citation}"
                 .strip())
             if landlord_cites:
-                quote = self._snippet_for_citation(
+                quote = landlord_line or self._snippet_for_citation(
                     chunks[landlord_cites[0]],
                     prefer_terms=landlord_names + ["landlord"])
                 evidence_lines.append(f'- "{quote}" [C{landlord_cites[0]}]')
         else:
             missing_lines.append("- Landlord name was not clearly found.")
 
-        if agent_names:
+        if agent_names or agent_line:
             citation = f"[C{agent_cites[0]}]" if agent_cites else ""
+            if agent_names:
+                agent_text = ", ".join(agent_names)
+            else:
+                agent_text = agent_line.split(":", 1)[-1].strip()
             key_lines.append(
-                f"- Landlord's agent appears as: {', '.join(agent_names)} {citation}"
+                f"- Landlord's agent appears as: {agent_text} {citation}"
                 .strip())
             if agent_cites:
-                quote = self._snippet_for_citation(
+                quote = agent_line or self._snippet_for_citation(
                     chunks[agent_cites[0]],
                     prefer_terms=agent_names + ["agent"])
                 evidence_lines.append(f'- "{quote}" [C{agent_cites[0]}]')
