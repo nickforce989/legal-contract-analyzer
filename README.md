@@ -43,14 +43,17 @@ examples/legal_contract_analyzer/
 
 1. Create and activate a virtual environment.
 2. Install dependencies.
-3. Start the API.
-4. (Optional) Start Gradio frontend.
+3. Accept the Llama 3.1 license and set your Hugging Face token (default local model).
+4. Start the API.
+5. (Optional) Start Gradio frontend.
 
 ```bash
 cd /Users/niccoloforzano/Downloads/legal-contract-analyzer
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+export LEGAL_ANALYZER_HF_TOKEN=YOUR_HF_TOKEN
+# or: export HF_TOKEN=YOUR_HF_TOKEN
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -78,6 +81,11 @@ curl -sS -X POST "http://localhost:8000/analyze" \
 - `LEGAL_ANALYZER_LLM_MODE` (default: `local`; options: `local`, `remote`)
 - `LEGAL_ANALYZER_MODEL_PROFILE` (default: `quality`; options: `fast`, `balanced`, `quality`)
 - `LEGAL_ANALYZER_DATA_DIR` (default: `./data`)
+- `LEGAL_ANALYZER_NOTEBOOK_MODE` (default: `false`; toggles notebook-like prompts/retrieval defaults)
+- `LEGAL_ANALYZER_PROMPT_STYLE` (default: `structured`; options: `structured`, `notebook`)
+- `LEGAL_ANALYZER_SIMPLE_RETRIEVAL` (default: `false`; skip lexical/cross rerank, use FAISS top-k)
+- `LEGAL_ANALYZER_DEFAULT_TOP_K` (default: `0`; if >0, overrides request `top_k`)
+- `LEGAL_ANALYZER_HF_TOKEN` (default: empty; fallback: `HF_TOKEN`)
 - `LEGAL_ANALYZER_EMBED_MODEL` (default by profile)
 - `LEGAL_ANALYZER_LLM_MODEL` (default by profile)
 - `LEGAL_ANALYZER_FALLBACK_LLM_MODEL` (default: `TinyLlama/TinyLlama-1.1B-Chat-v1.0`)
@@ -113,7 +121,20 @@ curl -sS -X POST "http://localhost:8000/analyze" \
 
 - `fast`: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (quickest, lowest quality).
 - `balanced`: `Qwen/Qwen2.5-0.5B-Instruct` (good speed/quality on CPU).
-- `quality`: `Qwen/Qwen2.5-1.5B-Instruct` (best local quality, slower startup).
+- `quality`: `meta-llama/Meta-Llama-3.1-8B-Instruct` (best local quality, requires HF token and GPU).
+
+### Notebook Parity (Optional)
+
+To make the API behave closer to the local notebook (notebook prompt, notebook
+chunking, dense-only retrieval), start the server with:
+
+```bash
+export LEGAL_ANALYZER_NOTEBOOK_MODE=true
+export LEGAL_ANALYZER_DEFAULT_TOP_K=5
+export LEGAL_ANALYZER_LLM_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct
+export LEGAL_ANALYZER_HF_TOKEN=YOUR_HF_TOKEN
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
 
 ### Remote 7B+ Example
 

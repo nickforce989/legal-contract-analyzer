@@ -25,9 +25,13 @@ import torch
 import torch.nn.functional as F
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSequenceClassification, AutoTokenizer)
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:  # pragma: no cover - optional dependency
+    SentenceTransformer = None
 
 from app.config import Settings
-from app.pdf_utils import chunk_text, extract_text_from_pdf
+from app.pdf_utils import chunk_text, chunk_text_notebook, extract_text_from_pdf
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]{3,}")
 _TIME_PHRASE_RE = re.compile(
@@ -75,6 +79,28 @@ _OCR_HEADER_RE = re.compile(
 )
 _MULTISPACE_RE = re.compile(r"\s+")
 
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are a senior contract review assistant. Use only the provided "
+    "evidence and never invent missing facts."
+)
+_NOTEBOOK_SYSTEM_PROMPT = (
+    "You are a legal contract analyst. Answer questions about contracts accurately.\n\n"
+    "Rules:\n"
+    "- Answer ONLY from the provided context. Do not use outside knowledge.\n"
+    "- Always cite the specific clause or section your answer is based on.\n"
+    "- If the answer is not in the context, say: \"This information is not present in the "
+    "provided contract sections.\"\n"
+    "- Distinguish between mandatory obligations ('shall') and optional permissions ('may').\n"
+    "- Be precise and concise."
+)
+
+
+def _hf_token_kwargs(hf_token: str | None) -> dict[str, str]:
+    token = (hf_token or "").strip()
+    if not token:
+        return {}
+    return {"token": token}
+
 
 @jax.jit
 def _jax_cosine_similarity(query: jnp.ndarray,
@@ -101,12 +127,36 @@ class ExtractedFact:
     citations: list[int]
 
 
-class HFEmbeddingEncoder:
+class STEmbeddingEncoder:
 
     def __init__(self, model_name: str, device: str):
+        if SentenceTransformer is None:
+            raise RuntimeError("sentence-transformers is not installed")
         self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(device)
+        self.model = SentenceTransformer(model_name, device=device)
+
+    def encode(self, texts: list[str], batch_size: int = 12) -> np.ndarray:
+        if not texts:
+            raise ValueError("encode received empty input")
+        embeddings = self.model.encode(
+            texts,
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return np.asarray(embeddings, dtype="float32")
+
+
+class HFEmbeddingEncoder:
+
+    def __init__(self, model_name: str, device: str,
+                 hf_token: str | None = None):
+        self.device = device
+        token_kwargs = _hf_token_kwargs(hf_token)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, **token_kwargs)
+        self.model = AutoModel.from_pretrained(model_name,
+                                               **token_kwargs).to(device)
         self.model.eval()
 
     @staticmethod
@@ -141,12 +191,15 @@ class HFEmbeddingEncoder:
 
 class HFPairReranker:
 
-    def __init__(self, model_name: str, device: str):
+    def __init__(self, model_name: str, device: str,
+                 hf_token: str | None = None):
         self.model_name = model_name
         self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        token_kwargs = _hf_token_kwargs(hf_token)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, **token_kwargs)
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name).to(device)
+            model_name, **token_kwargs).to(device)
         self.model.eval()
 
     def score_pairs(self, query: str, docs: list[str],
@@ -176,18 +229,30 @@ class HFPairReranker:
 
 class HFTextGenerator:
 
-    def __init__(self, model_name: str, device: str, dtype: torch.dtype,
-                 max_new_tokens: int, temperature: float, top_p: float):
+    def __init__(self,
+                 model_name: str,
+                 device: str,
+                 dtype: torch.dtype,
+                 max_new_tokens: int,
+                 temperature: float,
+                 top_p: float,
+                 hf_token: str | None = None,
+                 system_prompt: str | None = None,
+                 notebook_mode: bool = False):
         self.model_name = model_name
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        self.notebook_mode = notebook_mode
+        token_kwargs = _hf_token_kwargs(hf_token)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, **token_kwargs)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype).to(device)
+            model_name, torch_dtype=dtype, **token_kwargs).to(device)
         self.model.eval()
         self.max_context_tokens = self._resolve_context_window()
         reserve = min(self.max_new_tokens, max(64, self.max_context_tokens // 2))
@@ -208,9 +273,7 @@ class HFTextGenerator:
             messages = [{
                 "role":
                 "system",
-                "content":
-                "You are a senior contract review assistant. Use only the "
-                "provided evidence and never invent missing facts.",
+                "content": self.system_prompt,
             }, {
                 "role": "user",
                 "content": user_prompt
@@ -232,17 +295,27 @@ class HFTextGenerator:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            generation_kwargs: dict[str, Any] = {
-                "max_new_tokens": self.max_new_tokens,
-                "do_sample": self.temperature > 0,
-                "repetition_penalty": 1.08,
-                "no_repeat_ngram_size": 3,
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-            }
-            if self.temperature > 0:
-                generation_kwargs["temperature"] = self.temperature
-                generation_kwargs["top_p"] = self.top_p
+            if self.notebook_mode:
+                generation_kwargs: dict[str, Any] = {
+                    "max_new_tokens": self.max_new_tokens,
+                    "do_sample": False,
+                    "temperature": 1.0,
+                    "repetition_penalty": 1.1,
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.eos_token_id,
+                }
+            else:
+                generation_kwargs = {
+                    "max_new_tokens": self.max_new_tokens,
+                    "do_sample": self.temperature > 0,
+                    "repetition_penalty": 1.08,
+                    "no_repeat_ngram_size": 3,
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                }
+                if self.temperature > 0:
+                    generation_kwargs["temperature"] = self.temperature
+                    generation_kwargs["top_p"] = self.top_p
             output_ids = self.model.generate(
                 **inputs,
                 **generation_kwargs,
@@ -279,6 +352,7 @@ class OpenAICompatibleRemoteGenerator:
         temperature: float,
         top_p: float,
         timeout_seconds: int,
+        system_prompt: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key.strip()
@@ -287,6 +361,7 @@ class OpenAICompatibleRemoteGenerator:
         self.temperature = temperature
         self.top_p = top_p
         self.timeout_seconds = timeout_seconds
+        self.system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
         parsed = urlparse(self.base_url)
         host = (parsed.hostname or "").lower()
         is_local_endpoint = host in {"localhost", "127.0.0.1", "::1"}
@@ -331,9 +406,7 @@ class OpenAICompatibleRemoteGenerator:
             "messages": [{
                 "role":
                 "system",
-                "content":
-                "You are a senior contract review assistant. Use only the "
-                "provided evidence and never invent missing facts.",
+                "content": self.system_prompt,
             }, {
                 "role": "user",
                 "content": user_prompt
@@ -396,11 +469,33 @@ class ContractRAGEngine:
         self._active_llm_model_name: str | None = None
         self._model_lock = threading.Lock()
 
+    def _system_prompt(self) -> str:
+        if self.settings.prompt_style == "notebook":
+            return _NOTEBOOK_SYSTEM_PROMPT
+        return _DEFAULT_SYSTEM_PROMPT
+
+    def _resolve_top_k(self, requested: int, default: int) -> int:
+        if self.settings.default_top_k > 0:
+            return self.settings.default_top_k
+        return max(1, int(requested or default))
+
     def _ensure_embedder(self) -> None:
         with self._model_lock:
             if self._embedder is None:
+                if self.settings.notebook_mode and SentenceTransformer is not None:
+                    try:
+                        self._embedder = STEmbeddingEncoder(
+                            self.settings.embedding_model_name,
+                            self.settings.device,
+                        )
+                        return
+                    except Exception as exc:
+                        print("SentenceTransformer embedder unavailable; "
+                              f"falling back to HF encoder. Reason: {exc}")
                 self._embedder = HFEmbeddingEncoder(
-                    self.settings.embedding_model_name, self.settings.device)
+                    self.settings.embedding_model_name,
+                    self.settings.device,
+                    hf_token=self.settings.hf_token)
 
     def _ensure_generator(self) -> None:
         self._ensure_embedder()
@@ -417,6 +512,7 @@ class ContractRAGEngine:
                             top_p=self.settings.top_p,
                             timeout_seconds=self.settings.
                             remote_llm_timeout_seconds,
+                            system_prompt=self._system_prompt(),
                         )
                         self._active_llm_model_name = (
                             self.settings.remote_llm_model_name)
@@ -434,6 +530,9 @@ class ContractRAGEngine:
                             max_new_tokens=self.settings.max_new_tokens,
                             temperature=self.settings.temperature,
                             top_p=self.settings.top_p,
+                            hf_token=self.settings.hf_token,
+                            system_prompt=self._system_prompt(),
+                            notebook_mode=self.settings.notebook_mode,
                         )
                         self._active_llm_model_name = fallback
                         return
@@ -447,6 +546,9 @@ class ContractRAGEngine:
                         max_new_tokens=self.settings.max_new_tokens,
                         temperature=self.settings.temperature,
                         top_p=self.settings.top_p,
+                        hf_token=self.settings.hf_token,
+                        system_prompt=self._system_prompt(),
+                        notebook_mode=self.settings.notebook_mode,
                     )
                     self._active_llm_model_name = primary
                 except Exception as primary_exc:
@@ -467,6 +569,9 @@ class ContractRAGEngine:
                         max_new_tokens=self.settings.max_new_tokens,
                         temperature=self.settings.temperature,
                         top_p=self.settings.top_p,
+                        hf_token=self.settings.hf_token,
+                        system_prompt=self._system_prompt(),
+                        notebook_mode=self.settings.notebook_mode,
                     )
                     self._active_llm_model_name = fallback
 
@@ -481,6 +586,7 @@ class ContractRAGEngine:
                 self._reranker = HFPairReranker(
                     model_name=self.settings.cross_encoder_model_name,
                     device=self.settings.device,
+                    hf_token=self.settings.hf_token,
                 )
             except Exception as exc:
                 self._reranker = None
@@ -504,6 +610,9 @@ class ContractRAGEngine:
                 max_new_tokens=self.settings.max_new_tokens,
                 temperature=self.settings.temperature,
                 top_p=self.settings.top_p,
+                hf_token=self.settings.hf_token,
+                system_prompt=self._system_prompt(),
+                notebook_mode=self.settings.notebook_mode,
             )
             self._active_llm_model_name = fallback
 
@@ -580,8 +689,12 @@ class ContractRAGEngine:
         if not text.strip():
             raise ValueError("No extractable text found in PDF")
 
-        chunks = chunk_text(text, self.settings.chunk_size,
-                            self.settings.chunk_overlap)
+        if self.settings.notebook_mode:
+            chunks = chunk_text_notebook(text, self.settings.chunk_size,
+                                         self.settings.chunk_overlap)
+        else:
+            chunks = chunk_text(text, self.settings.chunk_size,
+                                self.settings.chunk_overlap)
         if not chunks:
             raise ValueError("Failed to build text chunks from the PDF")
 
@@ -647,7 +760,22 @@ class ContractRAGEngine:
         resolved_factor = max(1, int(resolved_factor))
 
         fetch_k = min(len(chunks), max(top_k, top_k * resolved_factor))
-        _, indices = index.search(query_embedding.reshape(1, -1), fetch_k)
+        distances, indices = index.search(query_embedding.reshape(1, -1),
+                                          fetch_k)
+        if self.settings.simple_retrieval:
+            retrieved: list[RetrievedChunk] = []
+            for rank, idx in enumerate(indices[0][:top_k]):
+                if idx < 0:
+                    continue
+                chunk_id = int(idx)
+                retrieved.append(
+                    RetrievedChunk(
+                        chunk_id=chunk_id,
+                        score=float(distances[0][rank]),
+                        text=chunks[chunk_id],
+                    ))
+            return retrieved
+
         candidate_ids = [int(i) for i in indices[0] if i >= 0]
         if not candidate_ids:
             return []
@@ -731,7 +859,20 @@ class ContractRAGEngine:
         return "\n\n".join(context_blocks)
 
     @staticmethod
-    def _build_qa_prompt(query: str, retrieved: list[RetrievedChunk]) -> str:
+    def _build_notebook_context(retrieved: list[RetrievedChunk]) -> str:
+        return "\n\n---\n\n".join(item.text for item in retrieved)
+
+    @staticmethod
+    def _build_notebook_qa_prompt(query: str,
+                                  retrieved: list[RetrievedChunk]) -> str:
+        context = ContractRAGEngine._build_notebook_context(retrieved)
+        return f"Question: {query}\n\nContract sections:\n{context}"
+
+    def _build_qa_prompt(self, query: str,
+                         retrieved: list[RetrievedChunk]) -> str:
+        if self.settings.prompt_style == "notebook":
+            return self._build_notebook_qa_prompt(query, retrieved)
+
         highlights = ContractRAGEngine._extract_evidence_highlights(
             query, retrieved)
         context = ContractRAGEngine._build_context_block(retrieved)
@@ -762,8 +903,17 @@ class ContractRAGEngine:
             f"Priority Evidence Snippets:\n{highlight_text}\n\n"
             f"Evidence:\n{context}\n")
 
-    @staticmethod
-    def _build_summary_prompt(retrieved: list[RetrievedChunk]) -> str:
+    def _build_summary_prompt(self, retrieved: list[RetrievedChunk]) -> str:
+        if self.settings.prompt_style == "notebook":
+            context = ContractRAGEngine._build_notebook_context(retrieved)
+            return (
+                "Provide a concise contract summary using ONLY the provided "
+                "context. If the summary is missing key information, say: "
+                "\"This information is not present in the provided contract "
+                "sections.\"\n\n"
+                f"Contract sections:\n{context}"
+            )
+
         context = ContractRAGEngine._build_context_block(retrieved)
 
         return (
@@ -1502,6 +1652,8 @@ class ContractRAGEngine:
 
     def _try_answer_party_identity_query(self, document_id: str, query: str,
                                          top_k: int) -> dict[str, Any] | None:
+        if self.settings.prompt_style == "notebook":
+            return None
         if not self._is_party_identity_query(query):
             return None
         doc = self._load_document(document_id)
@@ -1810,12 +1962,13 @@ class ContractRAGEngine:
 
     def answer_query(self, document_id: str, query: str,
                      top_k: int) -> dict[str, Any]:
+        effective_top_k = self._resolve_top_k(top_k, default=5)
         identity_answer = self._try_answer_party_identity_query(
-            document_id, query, top_k)
+            document_id, query, effective_top_k)
         if identity_answer is not None:
             return identity_answer
 
-        retrieved = self._retrieve(document_id, query, top_k)
+        retrieved = self._retrieve(document_id, query, effective_top_k)
         if not retrieved:
             raise ValueError("No matching chunks found for query")
 
@@ -1851,7 +2004,8 @@ class ContractRAGEngine:
         summary_query = (
             "Generate a complete contract summary including obligations, "
             "termination rights, liability, and red flags.")
-        retrieved = self._retrieve(document_id, summary_query, top_k=8)
+        summary_top_k = self._resolve_top_k(8, default=8)
+        retrieved = self._retrieve(document_id, summary_query, top_k=summary_top_k)
         if not retrieved:
             raise ValueError("No chunks available for summary")
 

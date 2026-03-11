@@ -50,3 +50,25 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
         start = end - overlap
 
     return chunks
+
+
+def chunk_text_notebook(text: str, chunk_size: int,
+                        overlap: int) -> list[str]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size")
+
+    text = " ".join(text.split())
+    if not text:
+        return []
+
+    chunks: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        chunks.append(text[i:i + chunk_size])
+        i += chunk_size - overlap
+    return chunks

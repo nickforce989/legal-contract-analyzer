@@ -10,6 +10,23 @@ import gradio as gr
 import requests
 
 API_URL = os.getenv("LEGAL_ANALYZER_API_URL", "http://localhost:8000").rstrip("/")
+NOTEBOOK_MODE = os.getenv("LEGAL_ANALYZER_NOTEBOOK_MODE",
+                          "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+DEFAULT_TOP_K = _env_int("LEGAL_ANALYZER_DEFAULT_TOP_K", 0)
+if NOTEBOOK_MODE and DEFAULT_TOP_K <= 0:
+    DEFAULT_TOP_K = 5
 
 
 def _safe_json(resp: requests.Response) -> dict[str, Any]:
@@ -102,7 +119,13 @@ with gr.Blocks(title="Legal Contract Analyzer") as demo:
         question = gr.Textbox(label="Question",
                               placeholder="What are the termination obligations?",
                               lines=3)
-        top_k = gr.Slider(label="Top K Chunks", minimum=1, maximum=12, value=5)
+        if DEFAULT_TOP_K > 0:
+            top_k = gr.State(value=DEFAULT_TOP_K)
+        else:
+            top_k = gr.Slider(label="Top K Chunks",
+                              minimum=1,
+                              maximum=12,
+                              value=5)
 
     with gr.Row():
         analyze_btn = gr.Button("Analyze Question")

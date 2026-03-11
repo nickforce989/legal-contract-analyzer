@@ -14,6 +14,11 @@ class Settings:
     llm_mode: str
     model_profile: str
     data_dir: Path
+    notebook_mode: bool
+    prompt_style: str
+    simple_retrieval: bool
+    default_top_k: int
+    hf_token: str
     embedding_model_name: str
     llm_model_name: str
     fallback_llm_model_name: str
@@ -45,6 +50,23 @@ class Settings:
                 "1", "true", "yes", "on"
             }
 
+        notebook_mode = env_bool("LEGAL_ANALYZER_NOTEBOOK_MODE", "false")
+        prompt_style = os.getenv(
+            "LEGAL_ANALYZER_PROMPT_STYLE",
+            "notebook" if notebook_mode else "structured",
+        ).strip().lower()
+        if prompt_style not in {"structured", "notebook"}:
+            prompt_style = "structured"
+        simple_retrieval = env_bool(
+            "LEGAL_ANALYZER_SIMPLE_RETRIEVAL",
+            "true" if notebook_mode else "false",
+        )
+        default_top_k = int(
+            os.getenv("LEGAL_ANALYZER_DEFAULT_TOP_K",
+                      "5" if notebook_mode else "0"))
+        if default_top_k < 0:
+            default_top_k = 0
+
         llm_mode = os.getenv("LEGAL_ANALYZER_LLM_MODE", "local").lower()
         if llm_mode not in {"local", "remote"}:
             llm_mode = "local"
@@ -58,7 +80,7 @@ class Settings:
         default_llm_by_profile = {
             "fast": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             "balanced": "Qwen/Qwen2.5-0.5B-Instruct",
-            "quality": "Qwen/Qwen2.5-1.5B-Instruct",
+            "quality": "meta-llama/Meta-Llama-3.1-8B-Instruct",
         }
         if profile not in default_llm_by_profile:
             profile = "balanced"
@@ -73,6 +95,12 @@ class Settings:
             llm_mode=llm_mode,
             model_profile=profile,
             data_dir=data_dir,
+            notebook_mode=notebook_mode,
+            prompt_style=prompt_style,
+            simple_retrieval=simple_retrieval,
+            default_top_k=default_top_k,
+            hf_token=os.getenv("LEGAL_ANALYZER_HF_TOKEN",
+                               os.getenv("HF_TOKEN", "")).strip(),
             embedding_model_name=os.getenv("LEGAL_ANALYZER_EMBED_MODEL",
                                            default_embed_by_profile[profile]),
             llm_model_name=os.getenv("LEGAL_ANALYZER_LLM_MODEL",
@@ -92,15 +120,21 @@ class Settings:
             remote_llm_timeout_seconds=int(
                 os.getenv("LEGAL_ANALYZER_REMOTE_LLM_TIMEOUT_SECONDS", "180")),
             two_stage_generation=env_bool("LEGAL_ANALYZER_TWO_STAGE_GENERATION",
-                                          "true"),
-            chunk_size=int(os.getenv("LEGAL_ANALYZER_CHUNK_SIZE", "1200")),
-            chunk_overlap=int(os.getenv("LEGAL_ANALYZER_CHUNK_OVERLAP", "200")),
+                                          "false" if notebook_mode else "true"),
+            chunk_size=int(
+                os.getenv("LEGAL_ANALYZER_CHUNK_SIZE",
+                          "1500" if notebook_mode else "1200")),
+            chunk_overlap=int(
+                os.getenv("LEGAL_ANALYZER_CHUNK_OVERLAP",
+                          "200" if notebook_mode else "200")),
             embedding_batch_size=int(
                 os.getenv("LEGAL_ANALYZER_EMBED_BATCH_SIZE", "12")),
             retrieval_candidate_factor=int(
-                os.getenv("LEGAL_ANALYZER_RETRIEVAL_CANDIDATE_FACTOR", "5")),
+                os.getenv("LEGAL_ANALYZER_RETRIEVAL_CANDIDATE_FACTOR",
+                          "1" if notebook_mode else "5")),
             use_cross_encoder_rerank=env_bool(
-                "LEGAL_ANALYZER_USE_CROSS_ENCODER_RERANK", "true"),
+                "LEGAL_ANALYZER_USE_CROSS_ENCODER_RERANK",
+                "false" if notebook_mode else "true"),
             cross_encoder_model_name=os.getenv(
                 "LEGAL_ANALYZER_CROSS_ENCODER_MODEL",
                 "cross-encoder/ms-marco-MiniLM-L-6-v2"),
@@ -109,11 +143,13 @@ class Settings:
             cross_encoder_weight=float(
                 os.getenv("LEGAL_ANALYZER_CROSS_ENCODER_WEIGHT", "0.65")),
             max_new_tokens=int(
-                os.getenv("LEGAL_ANALYZER_MAX_NEW_TOKENS", "280")),
+                os.getenv("LEGAL_ANALYZER_MAX_NEW_TOKENS",
+                          "256" if notebook_mode else "280")),
             temperature=float(os.getenv("LEGAL_ANALYZER_TEMPERATURE", "0.0")),
             top_p=float(os.getenv("LEGAL_ANALYZER_TOP_P", "0.9")),
             lexical_rerank_weight=float(
-                os.getenv("LEGAL_ANALYZER_LEXICAL_RERANK_WEIGHT", "0.22")),
+                os.getenv("LEGAL_ANALYZER_LEXICAL_RERANK_WEIGHT",
+                          "0.0" if notebook_mode else "0.22")),
             fact_extract_max_facts=int(
                 os.getenv("LEGAL_ANALYZER_FACT_EXTRACT_MAX_FACTS", "16")),
             device=device,
