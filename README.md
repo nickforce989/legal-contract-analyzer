@@ -1,4 +1,4 @@
-# Legal Contract Analyzer (FastAPI + Hugging Face + PyTorch + JAX + FAISS)
+# Legal Contract Analyzer (FastAPI + Hugging Face + PyTorch + FAISS)
 
 This is a practical RAG app for legal contracts (NDA, lease, employment, MSA, etc.).
 
@@ -82,9 +82,11 @@ curl -sS -X POST "http://localhost:8000/analyze" \
 - `LEGAL_ANALYZER_MODEL_PROFILE` (default: `quality`; options: `fast`, `balanced`, `quality`)
 - `LEGAL_ANALYZER_DATA_DIR` (default: `./data`)
 - `LEGAL_ANALYZER_NOTEBOOK_MODE` (default: `false`; toggles notebook-like prompts/retrieval defaults)
-- `LEGAL_ANALYZER_PROMPT_STYLE` (default: `structured`; options: `structured`, `notebook`)
+- `LEGAL_ANALYZER_PROMPT_STYLE` (default: `notebook` for local, `structured` for remote; options: `structured`, `notebook`)
 - `LEGAL_ANALYZER_SIMPLE_RETRIEVAL` (default: `false`; skip lexical/cross rerank, use FAISS top-k)
 - `LEGAL_ANALYZER_DEFAULT_TOP_K` (default: `0`; if >0, overrides request `top_k`)
+- `LEGAL_ANALYZER_USE_4BIT` (default: `true` on CUDA, else `false`; requires `bitsandbytes` on Linux)
+- `LEGAL_ANALYZER_PARTY_IDENTITY_SHORTCUT` (default: `false`)
 - `LEGAL_ANALYZER_HF_TOKEN` (default: empty; fallback: `HF_TOKEN`)
 - `LEGAL_ANALYZER_EMBED_MODEL` (default by profile)
 - `LEGAL_ANALYZER_LLM_MODEL` (default by profile)
@@ -101,7 +103,7 @@ curl -sS -X POST "http://localhost:8000/analyze" \
 - `LEGAL_ANALYZER_CROSS_ENCODER_MODEL` (default: `cross-encoder/ms-marco-MiniLM-L-6-v2`)
 - `LEGAL_ANALYZER_CROSS_ENCODER_BATCH_SIZE` (default: `8`)
 - `LEGAL_ANALYZER_CROSS_ENCODER_WEIGHT` (default: `0.65`)
-- `LEGAL_ANALYZER_TWO_STAGE_GENERATION` (default: `true`)
+- `LEGAL_ANALYZER_TWO_STAGE_GENERATION` (default: `false`)
 - `LEGAL_ANALYZER_FACT_EXTRACT_MAX_FACTS` (default: `16`)
 - `LEGAL_ANALYZER_MAX_NEW_TOKENS` (default: `280`)
 - `LEGAL_ANALYZER_TEMPERATURE` (default: `0.0`)
@@ -115,7 +117,7 @@ curl -sS -X POST "http://localhost:8000/analyze" \
 - Increase `LEGAL_ANALYZER_RETRIEVAL_CANDIDATE_FACTOR` to widen the reranking pool.
 - Increase `LEGAL_ANALYZER_CROSS_ENCODER_WEIGHT` to rely more on cross-encoder reranking.
 - Keep `LEGAL_ANALYZER_TWO_STAGE_GENERATION=true` for fact-extraction + grounded final synthesis.
-- For small local models, keep `LEGAL_ANALYZER_MODEL_PROFILE=balanced` and rely on the structured renderer.
+- For small local models, keep `LEGAL_ANALYZER_MODEL_PROFILE=balanced` and use the notebook-style prompt.
 
 ### Recommended Profiles
 
@@ -131,10 +133,14 @@ chunking, dense-only retrieval), start the server with:
 ```bash
 export LEGAL_ANALYZER_NOTEBOOK_MODE=true
 export LEGAL_ANALYZER_DEFAULT_TOP_K=5
+export LEGAL_ANALYZER_USE_4BIT=true
 export LEGAL_ANALYZER_LLM_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct
 export LEGAL_ANALYZER_HF_TOKEN=YOUR_HF_TOKEN
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+On Colab/Linux, `bitsandbytes` is installed automatically; on macOS/CPU the
+4-bit path is skipped and full precision is used.
 
 ### Remote 7B+ Example
 

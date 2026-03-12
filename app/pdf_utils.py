@@ -32,7 +32,7 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     if overlap >= chunk_size:
         raise ValueError("overlap must be smaller than chunk_size")
 
-    text = normalize_whitespace(text)
+    text = " ".join(text.split())
     if not text:
         return []
 

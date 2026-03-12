@@ -5,10 +5,9 @@ python-multipart>=0.0.9
 pypdf>=5.0.0
 transformers>=4.45.0
 sentence-transformers>=3.0.0
+bitsandbytes>=0.43.0; platform_system == "Linux"
 torch>=2.3.0
 faiss-cpu>=1.8.0
-jax>=0.4.33
-jaxlib>=0.4.33
 numpy>=1.26.0
 gradio>=4.44.0
 requests>=2.32.0

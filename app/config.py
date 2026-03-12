@@ -18,6 +18,8 @@ class Settings:
     prompt_style: str
     simple_retrieval: bool
     default_top_k: int
+    use_4bit: bool
+    enable_party_identity_shortcut: bool
     hf_token: str
     embedding_model_name: str
     llm_model_name: str
@@ -50,13 +52,19 @@ class Settings:
                 "1", "true", "yes", "on"
             }
 
+        llm_mode = os.getenv("LEGAL_ANALYZER_LLM_MODE", "local").lower()
+        if llm_mode not in {"local", "remote"}:
+            llm_mode = "local"
+
         notebook_mode = env_bool("LEGAL_ANALYZER_NOTEBOOK_MODE", "false")
-        prompt_style = os.getenv(
-            "LEGAL_ANALYZER_PROMPT_STYLE",
-            "notebook" if notebook_mode else "structured",
-        ).strip().lower()
+        raw_prompt_style = os.getenv("LEGAL_ANALYZER_PROMPT_STYLE")
+        if raw_prompt_style:
+            prompt_style = raw_prompt_style.strip().lower()
+        else:
+            prompt_style = "notebook" if notebook_mode or llm_mode == "local" else "structured"
         if prompt_style not in {"structured", "notebook"}:
             prompt_style = "structured"
+
         simple_retrieval = env_bool(
             "LEGAL_ANALYZER_SIMPLE_RETRIEVAL",
             "true" if notebook_mode else "false",
@@ -66,10 +74,6 @@ class Settings:
                       "5" if notebook_mode else "0"))
         if default_top_k < 0:
             default_top_k = 0
-
-        llm_mode = os.getenv("LEGAL_ANALYZER_LLM_MODE", "local").lower()
-        if llm_mode not in {"local", "remote"}:
-            llm_mode = "local"
 
         profile = os.getenv("LEGAL_ANALYZER_MODEL_PROFILE", "quality").lower()
         default_embed_by_profile = {
@@ -90,6 +94,10 @@ class Settings:
             os.getenv("LEGAL_ANALYZER_DATA_DIR", str(base_dir / "data")))
         device = "cuda" if torch.cuda.is_available() else "cpu"
         torch_dtype = torch.float16 if device == "cuda" else torch.float32
+        use_4bit = env_bool("LEGAL_ANALYZER_USE_4BIT",
+                            "true" if device == "cuda" else "false")
+        enable_party_identity_shortcut = env_bool(
+            "LEGAL_ANALYZER_PARTY_IDENTITY_SHORTCUT", "false")
 
         return Settings(
             llm_mode=llm_mode,
@@ -99,6 +107,8 @@ class Settings:
             prompt_style=prompt_style,
             simple_retrieval=simple_retrieval,
             default_top_k=default_top_k,
+            use_4bit=use_4bit,
+            enable_party_identity_shortcut=enable_party_identity_shortcut,
             hf_token=os.getenv("LEGAL_ANALYZER_HF_TOKEN",
                                os.getenv("HF_TOKEN", "")).strip(),
             embedding_model_name=os.getenv("LEGAL_ANALYZER_EMBED_MODEL",
@@ -120,7 +130,7 @@ class Settings:
             remote_llm_timeout_seconds=int(
                 os.getenv("LEGAL_ANALYZER_REMOTE_LLM_TIMEOUT_SECONDS", "180")),
             two_stage_generation=env_bool("LEGAL_ANALYZER_TWO_STAGE_GENERATION",
-                                          "false" if notebook_mode else "true"),
+                                          "false"),
             chunk_size=int(
                 os.getenv("LEGAL_ANALYZER_CHUNK_SIZE",
                           "1500" if notebook_mode else "1200")),
@@ -134,7 +144,7 @@ class Settings:
                           "1" if notebook_mode else "5")),
             use_cross_encoder_rerank=env_bool(
                 "LEGAL_ANALYZER_USE_CROSS_ENCODER_RERANK",
-                "false" if notebook_mode else "true"),
+                "false"),
             cross_encoder_model_name=os.getenv(
                 "LEGAL_ANALYZER_CROSS_ENCODER_MODEL",
                 "cross-encoder/ms-marco-MiniLM-L-6-v2"),

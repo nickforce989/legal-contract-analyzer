@@ -17,14 +17,13 @@ from urllib.parse import urlparse
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import faiss
-import jax
-import jax.numpy as jnp
 import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
 from transformers import (AutoModel, AutoModelForCausalLM,
-                          AutoModelForSequenceClassification, AutoTokenizer)
+                          AutoModelForSequenceClassification, AutoTokenizer,
+                          BitsAndBytesConfig)
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:  # pragma: no cover - optional dependency
@@ -100,14 +99,6 @@ def _hf_token_kwargs(hf_token: str | None) -> dict[str, str]:
     if not token:
         return {}
     return {"token": token}
-
-
-@jax.jit
-def _jax_cosine_similarity(query: jnp.ndarray,
-                           docs: jnp.ndarray) -> jnp.ndarray:
-    query = query / (jnp.linalg.norm(query) + 1e-8)
-    docs = docs / (jnp.linalg.norm(docs, axis=1, keepdims=True) + 1e-8)
-    return jnp.sum(docs * query, axis=1)
 
 
 @dataclass
@@ -238,7 +229,8 @@ class HFTextGenerator:
                  top_p: float,
                  hf_token: str | None = None,
                  system_prompt: str | None = None,
-                 notebook_mode: bool = False):
+                 notebook_mode: bool = False,
+                 use_4bit: bool = False):
         self.model_name = model_name
         self.device = device
         self.max_new_tokens = max_new_tokens
@@ -246,13 +238,53 @@ class HFTextGenerator:
         self.top_p = top_p
         self.system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
         self.notebook_mode = notebook_mode
+        self.use_4bit = use_4bit and device == "cuda"
         token_kwargs = _hf_token_kwargs(hf_token)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, **token_kwargs)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype, **token_kwargs).to(device)
+        bnb_config: BitsAndBytesConfig | None = None
+        if self.use_4bit:
+            try:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_quant_type="nf4",
+                )
+            except Exception as exc:
+                print("4-bit config unavailable; continuing without 4-bit. "
+                      f"Reason: {exc}")
+                bnb_config = None
+                self.use_4bit = False
+
+        try:
+            if bnb_config is not None:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    torch_dtype=dtype,
+                    **token_kwargs,
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    **token_kwargs,
+                ).to(device)
+        except Exception as exc:
+            if bnb_config is None:
+                raise
+            print("4-bit model load failed; falling back to full precision. "
+                  f"Reason: {exc}")
+            self.use_4bit = False
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                **token_kwargs,
+            ).to(device)
         self.model.eval()
         self.max_context_tokens = self._resolve_context_window()
         reserve = min(self.max_new_tokens, max(64, self.max_context_tokens // 2))
@@ -295,7 +327,7 @@ class HFTextGenerator:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            if self.notebook_mode:
+            if self.notebook_mode or self.temperature <= 0:
                 generation_kwargs: dict[str, Any] = {
                     "max_new_tokens": self.max_new_tokens,
                     "do_sample": False,
@@ -307,15 +339,13 @@ class HFTextGenerator:
             else:
                 generation_kwargs = {
                     "max_new_tokens": self.max_new_tokens,
-                    "do_sample": self.temperature > 0,
-                    "repetition_penalty": 1.08,
-                    "no_repeat_ngram_size": 3,
+                    "do_sample": True,
+                    "temperature": self.temperature,
+                    "top_p": self.top_p,
+                    "repetition_penalty": 1.1,
                     "eos_token_id": self.tokenizer.eos_token_id,
-                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "pad_token_id": self.tokenizer.eos_token_id,
                 }
-                if self.temperature > 0:
-                    generation_kwargs["temperature"] = self.temperature
-                    generation_kwargs["top_p"] = self.top_p
             output_ids = self.model.generate(
                 **inputs,
                 **generation_kwargs,
@@ -533,6 +563,7 @@ class ContractRAGEngine:
                             hf_token=self.settings.hf_token,
                             system_prompt=self._system_prompt(),
                             notebook_mode=self.settings.notebook_mode,
+                            use_4bit=self.settings.use_4bit,
                         )
                         self._active_llm_model_name = fallback
                         return
@@ -549,6 +580,7 @@ class ContractRAGEngine:
                         hf_token=self.settings.hf_token,
                         system_prompt=self._system_prompt(),
                         notebook_mode=self.settings.notebook_mode,
+                        use_4bit=self.settings.use_4bit,
                     )
                     self._active_llm_model_name = primary
                 except Exception as primary_exc:
@@ -572,6 +604,7 @@ class ContractRAGEngine:
                         hf_token=self.settings.hf_token,
                         system_prompt=self._system_prompt(),
                         notebook_mode=self.settings.notebook_mode,
+                        use_4bit=self.settings.use_4bit,
                     )
                     self._active_llm_model_name = fallback
 
@@ -613,6 +646,7 @@ class ContractRAGEngine:
                 hf_token=self.settings.hf_token,
                 system_prompt=self._system_prompt(),
                 notebook_mode=self.settings.notebook_mode,
+                use_4bit=self.settings.use_4bit,
             )
             self._active_llm_model_name = fallback
 
@@ -718,13 +752,6 @@ class ContractRAGEngine:
         self._save_document(document_id, metadata, chunks, embeddings, index)
         return metadata
 
-    @staticmethod
-    def _jax_rerank(query_embedding: np.ndarray,
-                    candidate_embeddings: np.ndarray) -> np.ndarray:
-        query_jax = jnp.asarray(query_embedding, dtype=jnp.float32)
-        docs_jax = jnp.asarray(candidate_embeddings, dtype=jnp.float32)
-        return np.asarray(_jax_cosine_similarity(query_jax, docs_jax))
-
     def _retrieve(self, document_id: str, query: str, top_k: int,
                   candidate_factor: int | None = None) -> list[RetrievedChunk]:
         self._ensure_embedder()
@@ -776,12 +803,16 @@ class ContractRAGEngine:
                     ))
             return retrieved
 
-        candidate_ids = [int(i) for i in indices[0] if i >= 0]
-        if not candidate_ids:
+        candidate_pairs = [
+            (int(idx), float(score)) for idx, score in
+            zip(indices[0], distances[0]) if idx >= 0
+        ]
+        if not candidate_pairs:
             return []
 
-        candidate_embeddings = embeddings[candidate_ids]
-        dense_scores = self._jax_rerank(query_embedding, candidate_embeddings)
+        candidate_ids = [cid for cid, _ in candidate_pairs]
+        dense_scores = np.asarray([score for _, score in candidate_pairs],
+                                  dtype="float32")
         query_tokens = self._tokenize_legal_words(query)
         lexical_scores = np.asarray([
             self._lexical_overlap_score(query_tokens, chunks[cid])
@@ -872,6 +903,10 @@ class ContractRAGEngine:
                          retrieved: list[RetrievedChunk]) -> str:
         if self.settings.prompt_style == "notebook":
             return self._build_notebook_qa_prompt(query, retrieved)
+        if self.settings.llm_mode != "remote":
+            return self._build_notebook_qa_prompt(query, retrieved)
+        if self._prefer_structured_renderer():
+            return self._build_notebook_qa_prompt(query, retrieved)
 
         highlights = ContractRAGEngine._extract_evidence_highlights(
             query, retrieved)
@@ -905,6 +940,24 @@ class ContractRAGEngine:
 
     def _build_summary_prompt(self, retrieved: list[RetrievedChunk]) -> str:
         if self.settings.prompt_style == "notebook":
+            context = ContractRAGEngine._build_notebook_context(retrieved)
+            return (
+                "Provide a concise contract summary using ONLY the provided "
+                "context. If the summary is missing key information, say: "
+                "\"This information is not present in the provided contract "
+                "sections.\"\n\n"
+                f"Contract sections:\n{context}"
+            )
+        if self.settings.llm_mode != "remote":
+            context = ContractRAGEngine._build_notebook_context(retrieved)
+            return (
+                "Provide a concise contract summary using ONLY the provided "
+                "context. If the summary is missing key information, say: "
+                "\"This information is not present in the provided contract "
+                "sections.\"\n\n"
+                f"Contract sections:\n{context}"
+            )
+        if self._prefer_structured_renderer():
             context = ContractRAGEngine._build_notebook_context(retrieved)
             return (
                 "Provide a concise contract summary using ONLY the provided "
@@ -1323,34 +1376,10 @@ class ContractRAGEngine:
 
     @staticmethod
     def _is_readable_sentence(text: str) -> bool:
-        if not text:
+        if not text or len(text) < 30:
             return False
         words = re.findall(r"[A-Za-z][A-Za-z'`.-]*", text)
-        if len(words) < 7:
-            return False
-        # Skip heavily clipped fragments that often start mid-word.
-        if text and text[0].islower():
-            return False
-        short_ratio = sum(1 for w in words if len(w) <= 2) / max(1, len(words))
-        if short_ratio > 0.45:
-            return False
-        legal_terms = (
-            "landlord",
-            "contract-holder",
-            "tenant",
-            "notice",
-            "must",
-            "shall",
-            "may",
-            "terminate",
-            "term",
-            "rent",
-            "liability",
-        )
-        lowered = text.lower()
-        if not any(term in lowered for term in legal_terms):
-            return False
-        return True
+        return len(words) >= 6
 
     @staticmethod
     def _is_party_identity_query(query: str) -> bool:
@@ -1652,6 +1681,8 @@ class ContractRAGEngine:
 
     def _try_answer_party_identity_query(self, document_id: str, query: str,
                                          top_k: int) -> dict[str, Any] | None:
+        if not self.settings.enable_party_identity_shortcut:
+            return None
         if self.settings.prompt_style == "notebook":
             return None
         if not self._is_party_identity_query(query):
